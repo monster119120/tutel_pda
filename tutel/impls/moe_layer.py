@@ -91,6 +91,7 @@ class MOELayer(torch.nn.Module):
         for k in kwargs:
             raise Exception('Unrecognized argument provided to Tutel Moe-layer: %s' % k)
 
+        self.l_aux = 0
         self.group = group
         self.result_func = result_func
         self.skip_moe = (int(os.environ.get('SKIP_MOE', '0')) != 0)
@@ -216,6 +217,56 @@ class MOELayer(torch.nn.Module):
         self.protected_shape = y.shape
         return y.reshape(y.size(0), y.size(1), -1)
 
+    def forward_kongr(self, input: Tensor, gate_index=0, capacity_factor=None, top_k=None, a2a_ffn_overlap_degree=None, reserve_dims=1, inequivalent_tokens=False, adaptive_r=None):
+        if self.skip_moe:
+            result_output = input
+            result_output.l_aux = None
+            return self.result_func(result_output) if self.result_func is not None else result_output
+
+        original_shape, original_dtype  = input.shape, input.dtype
+        assert len(original_shape) >= 2, "Input data must be at least 2D tensor: (s)amples, .., (m)odel_dim"
+
+        x = input.reshape(-1, original_shape[-reserve_dims:].numel())
+        for p in self.experts.parameters():
+            x = x.to(p.dtype)
+            break
+        gctx = self.gates[gate_index]
+        if a2a_ffn_overlap_degree is not None:
+            self.a2a_ffn_overlap_degree = a2a_ffn_overlap_degree
+        a2a_ffn_overlap_degree = self.a2a_ffn_overlap_degree
+
+        def routing():
+            logits = gctx(x)
+
+            if self.training and gctx.gate_noise > 0:
+                logits_w_noise = logits + gctx.gate_noise * torch.randn_like(logits) / self.num_global_experts
+            else:
+                logits_w_noise = logits
+
+            scores = F.softmax(logits_w_noise, dim=1)    # (197, 6)
+            expert_id = torch.argmax(torch.mean(scores, dim=0)).item()
+
+            return expert_id
+
+
+        if x.is_cuda:
+            with torch.cuda.amp.autocast(enabled=False):
+                expert_id = routing()
+        else:
+            expert_id = routing()
+
+
+        batched_fc1_w = self.experts.batched_fc1_w[expert_id]
+        batched_fc1_bias = self.experts.batched_fc1_bias[expert_id]
+        batched_fc2_w = self.experts.batched_fc2_w[expert_id]
+        batched_fc2_bias = self.experts.batched_fc2_bias[expert_id]
+
+        y = torch.add(torch.matmul(x, batched_fc1_w.permute(1, 0)), batched_fc1_bias)
+        y = self.experts.activation_fn(y)
+        y = torch.add(torch.matmul(y, batched_fc2_w), batched_fc2_bias)
+        return y
+
+
     def forward(self, input: Tensor, gate_index=0, capacity_factor=None, top_k=None, a2a_ffn_overlap_degree=None, reserve_dims=1, inequivalent_tokens=False, adaptive_r=None):
         if self.skip_moe:
             result_output = input
@@ -242,13 +293,13 @@ class MOELayer(torch.nn.Module):
             else:
                 logits_w_noise = logits
 
-            scores = F.softmax(logits_w_noise, dim=1)
+            scores = F.softmax(logits_w_noise, dim=1)    # shape is (token_num, expert_num)
             if self.is_gshard_loss:
                 _loss_fn = lambda gates, topk_ids: losses.gshard_loss(gates, topk_ids)
             else:
                 _loss_fn = lambda gates, topk_ids: losses.load_importance_loss(
                     F.softmax(logits, dim=1), logits_w_noise.gather(index=topk_ids, dim=1),
-                    self.num_global_experts, gctx.gate_noise)
+                    self.num_global_experts, gctx.gate_noise)   
             return logits.dtype, extract_critical(scores,
                 top_k = gctx.top_k if top_k is None else top_k,
                 loss_fn = _loss_fn,
