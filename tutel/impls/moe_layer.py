@@ -261,7 +261,8 @@ class MOELayer(torch.nn.Module):
         batched_fc2_w = self.experts.batched_fc2_w[expert_id]
         batched_fc2_bias = self.experts.batched_fc2_bias[expert_id]
 
-        y = torch.add(torch.matmul(x, batched_fc1_w.permute(1, 0)), batched_fc1_bias)
+        # print(input.shape, batched_fc1_w.shape)
+        y = torch.add(torch.matmul(input, batched_fc1_w.permute(1, 0)), batched_fc1_bias)
         y = self.experts.activation_fn(y)
         y = torch.add(torch.matmul(y, batched_fc2_w), batched_fc2_bias)
         return y
