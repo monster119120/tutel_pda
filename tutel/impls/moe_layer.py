@@ -16,6 +16,7 @@ from torch import Tensor
 import torch.distributed as dist
 from torch.nn import ModuleList
 import torch.nn.functional as F
+import random
 
 from ..impls import communicate as C
 from ..impls.fast_dispatch import fast_encode, fast_decode, extract_critical
@@ -79,6 +80,7 @@ class MOELayer(torch.nn.Module):
         is_gshard_loss=True,
         parallel_type='adaptive:1',
         use_2dh=False,
+        idea=None,
         **kwargs
     ):
         super().__init__()
@@ -196,6 +198,23 @@ class MOELayer(torch.nn.Module):
 
         if seeds is not None and len(seeds) > 2 and seeds[2] is not None:
             torch.manual_seed(seeds[2])
+            
+        
+        # split expert vars
+        # self.scores_mat = None
+        # self.scores_accelerate_mat = None
+        # self.experts.split_experts()
+        # self.count = 0
+        # self.gate_interval = 3 # define static frquency to update gating matrix
+        
+        # self.expert_id=None # define which expert could be use now
+        # self.scores=torch.zeros([self.num_local_experts],dtype=torch.float).to('cuda') # equal to routing matrix
+        # self.change_rates = [[] for _ in range(self.num_local_experts)] # save the historical expert change rate
+        # self.accum_threshold = 0.3 # when the sum of the historical expert change rate accumuating to this threshold, load operation will be triggered
+        # self.max_history_len = 5 # define the maximum of the historical save length
+        # self.update_frequency=3 # define dynamic frquency to update gating matrix
+        # self.idea=idea # define the which gating strategy being used
+        # self.expert_pool_indices = [0, 1]
 
     def extra_repr(self):
         return 'Top-K(s) = %s, Total-Experts = %d [managed by %d device(s)],' % (
@@ -216,59 +235,148 @@ class MOELayer(torch.nn.Module):
         y = self.experts(x.view(x.size(0), x.size(1), *reserve_shape), self)
         self.protected_shape = y.shape
         return y.reshape(y.size(0), y.size(1), -1)
+    
+    def calculate_gating_matrix(self,input):
+        # calculate the gate matrix first
+        original_shape, original_dtype  = input.shape, input.dtype
+        # input.shape  torch.Size([1, 197, 384])
+        x = input.reshape(-1, original_shape[-reserve_dims:].numel())
+        # x.shape  torch.Size([197, 384])
+        gctx = self.gates[gate_index]
+        logits = gctx(x) # torch.Size([197, 4])
+    
+        if self.training and gctx.gate_noise > 0:
+            logits_w_noise = logits + gctx.gate_noise * torch.randn_like(logits) / self.num_global_experts
+        else:
+            logits_w_noise = logits
+        
+        scores = F.softmax(logits_w_noise, dim=1)    # (197, expert_num)
+        scores = torch.mean(scores, dim=0)
+        top2_k_logits, top2_k_indices = scores.topk(2, dim=-1)
+        return top2_k_indices
+    
+    def forward_fengqt(self, input: Tensor, gate_index=0, capacity_factor=None, top_k=None, a2a_ffn_overlap_degree=None, reserve_dims=1, inequivalent_tokens=True, adaptive_r=None):
+        # idea 1: 取前两个最高的expert进行缓存
+        if self.skip_moe:
+            result_output = input
+            result_output.l_aux = None
+            return self.result_func(result_output) if self.result_func is not None else result_output
+        if not self.change_frequency:
+            if self.count>=3 and self.expert_id is None:
+                top2_k_indices=self.calculate_gating_matrix(input)
+                # idea1: 直接去计算gate的前两个expert的权重，然后load进gpu中
+                if self.idea=='direct_load_top2':
+                    self.experts.move_experts(top2_k_indices)
+                    self.expert_id = top2_k_indices[0]
+                    self.count += 1
+                # idea2: 使用dist来判断当前与上一个matrix的相似度，小于一定阈值就判定大概率top1和top2有变化，提前load top2进去,否则就只load top1到gpu
+                elif self.idea=='use_similarity':
+                    dist = torch.norm(scores - self.scores, p=2)
+                    similarity=1/(1+dist)
+                    if similarity<0.9: # 相似度足够小，load进top2
+                        self.experts.move_experts(top2_k_indices)
+                    else: # 相似度不够，只load top1
+                        self.experts.move_experts(top2_k_indices[0])
+                    self.scores=scores
+                elif self.idea=='expert_change_rate':
+                    # idea2：每个epcho中，对于一维矩阵中的元素，需要去判断它的变化率是否累加到一个正数值，如果累加到后，就可以触发load top2
+                    for i in range(self.num_experts):
+                        change_rate = scores[i] - self.scores[i]
+                        self.change_rates[i].append(change_rate)
+                        if len(self.change_rates[i]) > self.max_history_len:
+                            self.change_rates[i].pop(0)
+                    top2=top2_k_indices[1]
+                    # 对top2的expert的历史变化率进行求和
+                    if sum(self.change_rates[top2]) > self.accum_threshold:
+                        self.experts.move_experts(top2_k_indices)
+                    else:
+                        self.experts.move_experts(top2_k_indices[0])
+                self.count=0
+        else:
+            if self.count>=self.update_frequency and self.expert_id is None:
+                top2_k_indices=self.calculate_gating_matrix(input)
+                # idea3: 动态改变更新的频率,更好地设定update的频率，尽量做到每次update就可以使得gates的top1能够更新，
+                # 或者说具备提前load top1和2进gpu，如果是渐变切换domain大概率是一个expert先占据top2，进而提升到top1
+                # 当然也有突变的情况，expert还没有提前load进去但是当前阶段就直接提升到top1，这属于极少部分情况
+                if self.idea=='update frequency':
+                    for i in range(self.num_experts):
+                        change_rate = scores[i] - self.scores[i]
+                        self.change_rates[i].append(change_rate)
+                        if len(self.change_rates[i]) > self.max_history_len:
+                            self.change_rates[i].pop(0)
+                    top2=top2_k_indices[1]
+                    # 对top2的expert的历史变化率进行求和,accum threshold是平均每一步的增长
+                    if sum(self.change_rates[top2])/len(self.change_rates[top2]) > self.accum_threshold/self.numberOfLoadTop2:
+                        self.experts.move_experts(top2_k_indices)
+                        
+                        # 间隔越大才能触发load top2，意味着后续的更新gate的频率可以减慢
+                        if self.numberOfLoadTop2>3:
+                            self.update_frequency=self.numberOfLoadTop2*2
+                        elif self.numberOfLoadTop2<=3:
+                            self.update_frequency=self.numberOfLoadTop2
+                        self.numberOfLoadTop2=0
+                    else:
+                        self.experts.move_experts(top2_k_indices[0])
+                        self.numberOfLoadTop2+=1 # 还没有触发load top2的操作
+                self.count=0
+        self.count+=1                    
+        # expert forward
+        return self.experts.split_forward(input, self.expert_id)
 
-    def forward_kongr(self, input: Tensor, gate_index=0, capacity_factor=None, top_k=None, a2a_ffn_overlap_degree=None, reserve_dims=1, inequivalent_tokens=False, adaptive_r=None):
+    def forward_kongr(self, input: Tensor, gate_index=0, capacity_factor=None, top_k=None, a2a_ffn_overlap_degree=None, reserve_dims=1, inequivalent_tokens=True, adaptive_r=None):
         if self.skip_moe:
             result_output = input
             result_output.l_aux = None
             return self.result_func(result_output) if self.result_func is not None else result_output
 
+
+        # gate calculation
         original_shape, original_dtype  = input.shape, input.dtype
-        assert len(original_shape) >= 2, "Input data must be at least 2D tensor: (s)amples, .., (m)odel_dim"
-
+        # print(input.shape) # torch.Size([64, 197, 384])
         x = input.reshape(-1, original_shape[-reserve_dims:].numel())
-        for p in self.experts.parameters():
-            x = x.to(p.dtype)
-            break
+        # print(x.shape) # torch.Size([12608, 384])
         gctx = self.gates[gate_index]
-        if a2a_ffn_overlap_degree is not None:
-            self.a2a_ffn_overlap_degree = a2a_ffn_overlap_degree
-        a2a_ffn_overlap_degree = self.a2a_ffn_overlap_degree
-
-        def routing():
-            logits = gctx(x)
-
-            if self.training and gctx.gate_noise > 0:
-                logits_w_noise = logits + gctx.gate_noise * torch.randn_like(logits) / self.num_global_experts
-            else:
-                logits_w_noise = logits
-
-            scores = F.softmax(logits_w_noise, dim=1)    # (197, 6)
-            expert_id = torch.argmax(torch.mean(scores, dim=0)).item()
-
-            return expert_id
-
-
-        if x.is_cuda:
-            with torch.cuda.amp.autocast(enabled=False):
-                expert_id = routing()
+        logits = gctx(x) # torch.Size([12608, 4])
+        # print(logits.shape)
+        if self.training and gctx.gate_noise > 0:
+            logits_w_noise = logits + gctx.gate_noise * torch.randn_like(logits) / self.num_global_experts
         else:
-            expert_id = routing()
+            logits_w_noise = logits
+        scores = F.softmax(logits_w_noise, dim=1)    # (197, expert_num)
+        scores = torch.mean(scores, dim=0)
+        socres_sorted_indices = torch.argsort(scores, descending=True).tolist()
+        # print(socres_sorted_indices)
+        
+        self.count += 1
+        if self.count > self.gate_interval:
+            # expert caching update (每隔self.gate_interval帧)
+            # 把score第二大的expert caching起来
+            second_best_expert_id = socres_sorted_indices[1]
+            
+            if socres_sorted_indices.index(self.expert_pool_indices[0]) < socres_sorted_indices.index(self.expert_pool_indices[1]):
+                self.expert_pool_indices[1] = second_best_expert_id
+                expert_id = self.expert_pool_indices[0]
+            else:
+                self.expert_pool_indices[0] = second_best_expert_id
+                expert_id = self.expert_pool_indices[1]
+                
+            self.experts.move_experts(self.expert_pool_indices)
+        
+            self.count = 0
+        else:
+            # expert selection（每帧）
+            # 从现有的两个expert中选出最好的那个使用
+            if socres_sorted_indices.index(self.expert_pool_indices[0]) < socres_sorted_indices.index(self.expert_pool_indices[1]):
+                expert_id = self.expert_pool_indices[0]
+            else:
+                expert_id = self.expert_pool_indices[1]
+        
+
+        # expert forward
+        return self.experts.split_forward(input, expert_id)
 
 
-        batched_fc1_w = self.experts.batched_fc1_w[expert_id]
-        batched_fc1_bias = self.experts.batched_fc1_bias[expert_id]
-        batched_fc2_w = self.experts.batched_fc2_w[expert_id]
-        batched_fc2_bias = self.experts.batched_fc2_bias[expert_id]
-
-        # print(input.shape, batched_fc1_w.shape)
-        y = torch.add(torch.matmul(input, batched_fc1_w.permute(1, 0)), batched_fc1_bias)
-        y = self.experts.activation_fn(y)
-        y = torch.add(torch.matmul(y, batched_fc2_w), batched_fc2_bias)
-        return y
-
-
-    def forward(self, input: Tensor, gate_index=0, capacity_factor=None, top_k=None, a2a_ffn_overlap_degree=None, reserve_dims=1, inequivalent_tokens=False, adaptive_r=None):
+    def forward(self, input: Tensor, gate_index=0, capacity_factor=None, top_k=None, a2a_ffn_overlap_degree=None, reserve_dims=1, inequivalent_tokens=True, adaptive_r=None):
         if self.skip_moe:
             result_output = input
             result_output.l_aux = None

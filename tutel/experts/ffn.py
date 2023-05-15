@@ -37,11 +37,73 @@ class FusedExpertsNetwork(torch.nn.Module):
             fc2 = torch.nn.Linear(hidden_size, self.output_dim)
             fc1_weight[0, i, :, :], fc1_bias[0, i, :] = fc1.weight, fc1.bias
             fc2_weight[0, i, :, :], fc2_bias[0, i, :] = fc2.weight.t(), fc2.bias[:fc2_bias.size(-1)]
-
+        # print(fc1_weight.squeeze(0).shape)
+        # print(fc2_weight.squeeze(0).shape)
+        # print(fc1_bias.squeeze(0).shape)
+        # print(fc2_bias.squeeze(0).shape)
         self.register_parameter(name='batched_fc1_w', param=torch.nn.Parameter(fc1_weight.squeeze(0)))
         self.register_parameter(name='batched_fc2_w', param=torch.nn.Parameter(fc2_weight.squeeze(0)))
         self.register_parameter(name='batched_fc1_bias', param=torch.nn.Parameter(fc1_bias.squeeze(0)))
         self.register_parameter(name='batched_fc2_bias', param=torch.nn.Parameter(fc2_bias.squeeze(0)))
+    
+    def split_experts(self):
+        self.batched_fc1_w_list = []
+        self.batched_fc2_w_list = []
+        self.batched_fc1_bias_list = []
+        self.batched_fc2_bias_list = []
+        for i in range(4):
+            self.batched_fc1_w_list.append(self.batched_fc1_w[i])
+            self.batched_fc2_w_list.append(self.batched_fc2_w[i])
+            self.batched_fc1_bias_list.append(self.batched_fc1_bias[i])
+            self.batched_fc2_bias_list.append(self.batched_fc2_bias[i])
+        
+            self.batched_fc1_w_list[i]=self.batched_fc1_w_list[i].to('cpu')
+            self.batched_fc2_w_list[i]=self.batched_fc2_w_list[i].to('cpu')
+            self.batched_fc1_bias_list[i]=self.batched_fc1_bias_list[i].to('cpu')
+            self.batched_fc2_bias_list[i]=self.batched_fc2_bias_list[i].to('cpu')
+    
+    def init_experts_devices(self):
+        for expert_id in range(2):
+            device='cuda'
+            non_blocking = True
+            self.batched_fc1_w_list[expert_id]=self.batched_fc1_w_list[expert_id].to(device, non_blocking=non_blocking)
+            self.batched_fc2_w_list[expert_id]=self.batched_fc2_w_list[expert_id].to(device, non_blocking=non_blocking)
+            self.batched_fc1_bias_list[expert_id]=self.batched_fc1_bias_list[expert_id].to(device, non_blocking=non_blocking)
+            self.batched_fc2_bias_list[expert_id]=self.batched_fc2_bias_list[expert_id].to(device, non_blocking=non_blocking)
+    
+    def move_experts(self, l=[]):
+        for expert_id in range(4):
+            if expert_id in l:
+                device='cuda'
+                non_blocking = True
+                self.batched_fc1_w_list[expert_id]=self.batched_fc1_w_list[expert_id].to(device, non_blocking=non_blocking)
+                self.batched_fc2_w_list[expert_id]=self.batched_fc2_w_list[expert_id].to(device, non_blocking=non_blocking)
+                self.batched_fc1_bias_list[expert_id]=self.batched_fc1_bias_list[expert_id].to(device, non_blocking=non_blocking)
+                self.batched_fc2_bias_list[expert_id]=self.batched_fc2_bias_list[expert_id].to(device, non_blocking=non_blocking)
+            else:
+                non_blocking = True
+                device='cpu'
+                self.batched_fc1_w_list[expert_id]=self.batched_fc1_w_list[expert_id].to(device, non_blocking=non_blocking)
+                self.batched_fc2_w_list[expert_id]=self.batched_fc2_w_list[expert_id].to(device, non_blocking=non_blocking)
+                self.batched_fc1_bias_list[expert_id]=self.batched_fc1_bias_list[expert_id].to(device, non_blocking=non_blocking)
+                self.batched_fc2_bias_list[expert_id]=self.batched_fc2_bias_list[expert_id].to(device, non_blocking=non_blocking)
+    
+    def split_forward(self, input, expert_id):
+        # self.batched_fc1_w_list[expert_id]=self.batched_fc1_w_list[expert_id].to('cuda')
+        # self.batched_fc2_w_list[expert_id]=self.batched_fc2_w_list[expert_id].to('cuda')
+        # self.batched_fc1_bias_list[expert_id]=self.batched_fc1_bias_list[expert_id].to('cuda')
+        # self.batched_fc2_bias_list[expert_id]=self.batched_fc2_bias_list[expert_id].to('cuda')
+        
+        y = torch.add(torch.matmul(input, self.batched_fc1_w_list[expert_id].permute(1, 0)), self.batched_fc1_bias_list[expert_id])
+        y = self.activation_fn(y)
+        y = torch.add(torch.matmul(y, self.batched_fc2_w_list[expert_id]), self.batched_fc2_bias_list[expert_id])
+        
+        # self.batched_fc1_w_list[expert_id]=self.batched_fc1_w_list[expert_id].to('cpu')
+        # self.batched_fc2_w_list[expert_id]=self.batched_fc2_w_list[expert_id].to('cpu')
+        # self.batched_fc1_bias_list[expert_id]=self.batched_fc1_bias_list[expert_id].to('cpu')
+        # self.batched_fc2_bias_list[expert_id]=self.batched_fc2_bias_list[expert_id].to('cpu')
+        
+        return y
 
     def extra_repr(self):
         return 'model_dim=%d, hidden_size=%d, output_dim=%d, local_experts=%d' % (
@@ -86,11 +148,12 @@ class FusedExpertsNetwork(torch.nn.Module):
         return y
 
     def to(self, *args, **kwargs):
+        # print(args,'@'*80)
         self = super().to(*args, **kwargs)
-        self.fc1_weight = self.fc1_weight.to(*args, **kwargs)
-        self.fc2_weight = self.fc2_weight.to(*args, **kwargs)
-        self.fc1_bias = self.fc1_bias.to(*args, **kwargs)
-        self.fc2_bias = self.fc2_bias.to(*args, **kwargs)
+        self.batched_fc1_w = self.batched_fc1_w.to(*args, **kwargs)
+        self.batched_fc2_w = self.batched_fc2_w.to(*args, **kwargs)
+        self.batched_fc1_bias = self.batched_fc1_bias.to(*args, **kwargs)
+        self.batched_fc2_bias = self.batched_fc2_bias.to(*args, **kwargs)
         return self
 
 ExpertModule = FusedExpertsNetwork 
